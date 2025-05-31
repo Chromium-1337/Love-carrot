@@ -1,40 +1,135 @@
 name: Build Kivy APK
 run-name: Building APK for ${{ github.actor }}
-on: [push]
+on: [push, pull_request]
 
 jobs:
   build-android:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04  # Стабильная версия Ubuntu
+    timeout-minutes: 60    # Таймаут для предотвращения зависания
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-        
+    # Устанавливаем Java 17 (требуется для современных Android tools)
     - name: Set up Java 17
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
         java-version: '17'
         
-    - name: Install dependencies
+    # Устанавливаем Python 3.9 (проверенная версия для Kivy)
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    # Очищаем возможные конфликты
+    - name: Clean previous builds
+      run: |
+        rm -rf ~/.buildozer
+        rm -rf .buildozer
+        rm -rf bin/
+        
+    # Устанавливаем системные зависимости
+    - name: Install system dependencies
       run: |
         sudo apt update
-        sudo apt install -y git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
-        pip install --upgrade pip
-        pip install buildozer cython==0.29.33
+        sudo apt install -y \
+          git zip unzip autoconf libtool pkg-config \
+          zlib1g-dev libncurses5-dev libncursesw5-dev \
+          cmake libffi-dev libssl-dev \
+          build-essential ccache \
+          libltdl-dev \
+          python3-dev python3-pip \
+          lld
+          
+    # Устанавливаем Python зависимости
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+        pip install buildozer==1.4.0
+        pip install cython==0.29.33
+        pip install colorama appdirs sh jinja2 six
         
-    - name: Build APK
+    # Настраиваем Android SDK лицензии
+    - name: Setup Android SDK licenses
+      run: |
+        mkdir -p ~/.android
+        echo 'count=0' > ~/.android/repositories.cfg
+        
+    # Инициализируем buildozer
+    - name: Initialize buildozer
       run: |
         buildozer init
-        buildozer android debug
         
+    # Модифицируем buildozer.spec для совместимости
+    - name: Configure buildozer.spec
+      run: |
+        # Устанавливаем совместимые версии
+        sed -i 's/#android.gradle_dependencies = /android.gradle_dependencies = /' buildozer.spec
+        sed -i 's/#android.add_gradle_repositories = /android.add_gradle_repositories = /' buildozer.spec
+        # Используем стабильные версии SDK
+        echo "" >> buildozer.spec
+        echo "android.api = 33" >> buildozer.spec
+        echo "android.minapi = 21" >> buildozer.spec
+        echo "android.ndk = 25b" >> buildozer.spec
+        echo "android.sdk = 33" >> buildozer.spec
+        echo "android.accept_sdk_license = True" >> buildozer.spec
+        
+    # Устанавливаем Android SDK с автоматическим принятием лицензий
+    - name: Build APK with license handling
+      run: |
+        # Автоматически принимаем все лицензии
+        export ANDROID_SDK_ROOT=~/.buildozer/android/platform/android-sdk
+        export JAVA_HOME=$JAVA_HOME_17_X64
+        export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
+        
+        # Начинаем сборку с автоматическим принятием лицензий
+        echo "Starting APK build..."
+        timeout 45m bash -c '
+          (echo y; echo y; echo y; echo y; echo y; echo y; echo y; echo y) | buildozer android debug
+        ' || {
+          echo "First build attempt failed, trying alternative approach..."
+          
+          # Альтернативный подход с принятием лицензий
+          if [ -f ~/.buildozer/android/platform/android-sdk/cmdline-tools/latest/bin/sdkmanager ]; then
+            echo "Accepting licenses manually..."
+            yes | ~/.buildozer/android/platform/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+          fi
+          
+          # Повторная попытка сборки
+          echo "Retrying build..."
+          buildozer android debug
+        }
+        
+    # Проверяем результат сборки
+    - name: Verify APK creation
+      run: |
+        if [ -f bin/*.apk ]; then
+          echo "APK successfully created!"
+          ls -la bin/
+        else
+          echo "APK not found, checking for errors..."
+          find . -name "*.apk" -type f
+          exit 1
+        fi
+        
+    # Загружаем готовый APK
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: kivy-app-apk
+        name: kivy-app-apk-${{ github.sha }}
         path: bin/*.apk
+        retention-days: 30
+        
+    # Загружаем логи в случае ошибки
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ github.sha }}
+        path: |
+          .buildozer/android/platform/python-for-android/dist/*/build.log
+          .buildozer/android/logs/*
+        retention-days: 7
